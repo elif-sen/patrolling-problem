@@ -380,7 +380,7 @@ class KRobotAssignment:
         """
         return 2 ** math.ceil(math.log2(w))
     
-    '''
+    
     @staticmethod
     def plot_robot_assignment(G, robots_trees, layout=None):
         """
@@ -435,8 +435,7 @@ class KRobotAssignment:
         plt.title("Robot Assignment")
         plt.axis('off')
         plt.show()
-    '''
-        
+    
     def group_by_dyadic_weights(self):
         """
         Group nodes by dyadic weight class.
@@ -449,7 +448,8 @@ class KRobotAssignment:
 
         wmax = max(rounded.values())
         wmin = min(rounded.values())
-        m = int(round(math.log2(wmax / wmin)))
+        ratio = wmax / wmin if wmin > 0 else 1
+        m = max(1, int(round(math.log2(ratio))))
 
         W = {}
         for v, w in rounded.items():
@@ -457,7 +457,7 @@ class KRobotAssignment:
             if j not in W:
                 W[j] = set()
             W[j].add(v)
-        # print(W)
+        # print(m)
         return W, m
     
     def k_robot_assignment(self, L):
@@ -465,6 +465,7 @@ class KRobotAssignment:
         Implements the k-robot assignment.
         Returns:
             {robot_id: [trees]}, or False if fails.
+            m: the floor of log(largest_node_weight / smallest_node_weight)
         """
         W, m = self.group_by_dyadic_weights()
 
@@ -484,6 +485,7 @@ class KRobotAssignment:
                         # KMinMaxTreeCover.plot_tree_cover(self.graph, trees, j)
                         T_Wj[j] = (trees, t)        # (trees, number of trees)
                         found = True
+                        break
                 except ValueError:                  # error raised if B too small
                     continue
 
@@ -498,9 +500,11 @@ class KRobotAssignment:
             trees, _ = T_Wj[j]           
             for T in trees:    
                 Q = set(T.nodes)
+                # print(Q)
                 for r in robots:
                     if robots[r]["depot"] is not None:  # if robot has depot, find j s.t. depot in V_j
                         depot = robots[r]["depot"]
+                        print(depot)
 
                         j0 = None
                         for jj, Wjj in W.items():
@@ -509,15 +513,13 @@ class KRobotAssignment:
                                 break
                         assert j0 is not None           # depot must be in one of j!
 
-                        '''
                         print("Q:")
                         print(Q)
                         print("Threshold")
                         print(self.k * (2 ** j0) * L)
 
                         for v in Q:
-                            print(nx.shortest_path_length(self.graph, v, depot,  weight='weight'))
-                        '''   
+                            print(nx.shortest_path_length(self.graph, v, depot, weight='weight'))
 
                         Q0 = {v for v in Q if nx.shortest_path_length(self.graph, v, depot,  weight='weight') <= self.k * (2 ** j0) * L}
 
@@ -534,36 +536,66 @@ class KRobotAssignment:
                     robots[new_r]["trees"].append(MST_Q)
                     robots[new_r]["depot"] = list(MST_Q.nodes)[0]
 
-        return {r: robots[r]["trees"] for r in robots if robots[r]["trees"]}
+        return {r: robots[r]["trees"] for r in robots if robots[r]["trees"]}, m
 
     def schedule(self):
         """
-        Guess and double L until a feasible k-robot schedule is found.
+        Find the smallest feasible L* using binary search.
         Returns:
-            ({robot_id: [trees]}, final L)
+            robots_trees: {robot_id: [trees]}
+            L*: final feasible L
+            m: floor of log(largest_node_weight / smallest_node_weight)
         """
+        # Compute initial upper bound and lower bound for L
         mst = nx.minimum_spanning_tree(self.graph, weight='weight')
         dmax = sum(d['weight'] for _, _, d in mst.edges(data=True))
-        L = dmax * 0.01
+        L_low = 1e-6  # or small positive epsilon
+        L_high = dmax
 
-        while True:
-            result = self.k_robot_assignment(L)
-            if result:
-                # KRobotAssignment.plot_robot_assignment(G, result)
-                return result, L
-            L *= 2  # Double guess
+        best_result = None
+        best_m = None
+        best_L = None
 
+        # Binary search loop
+        for _ in range(50):  # limit iterations to prevent infinite loop
+            L_mid = (L_low + L_high) / 2
+            result = self.k_robot_assignment(L_mid)
+
+            if result is False:
+                # L too small, need larger L
+                L_low = L_mid
+            else:
+                # L feasible — tighten upper bound
+                robots_trees, m = result
+                best_result = robots_trees
+                best_m = m
+                best_L = L_mid
+                L_high = L_mid
+            
+            print(L_mid)
+
+            # Early stopping if bounds converge
+            if abs(L_high - L_low) < 1e-6:
+                break
+
+        if best_result is None:
+            raise ValueError("Could not find feasible L in search range.")
+
+        return best_result, best_L, best_m
+        
 class SingleRobotSchedule:
-    def __init__(self, trees, L, k):
+    def __init__(self, trees, L, k, m):
         """
         Args:
             trees: list of trees for this robot, [T0, T1, ...], T0 is depot.
             L: the guessed bound L
             k: number of robots (used for epsilon)
+            m: the floor of log(largest_node_weight / smallest_node_weight)
         """
         self.trees = trees
         self.L = L
         self.k = k
+        self.m = m
         self.paths_per_tree = []
         self.epsilon = None
         self.tours = []
@@ -585,7 +617,7 @@ class SingleRobotSchedule:
             elif T.number_of_nodes() == 1:  
                 node = next(iter(T.nodes))
                 self.tours.append((node, 0))
-                self.paths_per_tree.append([node])
+                self.paths_per_tree.append([[node]])
                 self.idx.append(0)
                 continue
             else:
@@ -617,6 +649,8 @@ class SingleRobotSchedule:
                 # print(paths)
                 self.paths_per_tree.append(paths)
                 self.idx.append(0)
+        print("Path:")
+        print(self.paths_per_tree)
 
     def round_robin_sequence(self, steps):
         """
@@ -636,13 +670,14 @@ class SingleRobotSchedule:
                 i = (i + 1) % h
             idx[i] = (idx[i] + 1) % len(self.paths_per_tree[i])
             i = (i + 1) % h
+            # print(seq)
         return seq
 
     def full_round_robin_sequence(self):
         """
         Return the entire cycle of segments once.
         """
-        total = sum(len(p) for p in self.paths_per_tree) + 1
+        total = int(self.k ** 2 * math.log(max(self.k ** 2 * self.m, 2)) * self.L)
         return self.round_robin_sequence(total)
 
     def get_routes(self):
@@ -654,13 +689,31 @@ class SingleRobotSchedule:
 
 def schedule_all_routes(graph: nx.Graph, k: int):
     assignment = KRobotAssignment(graph, k, L=0)
-    robots_trees, L = assignment.schedule()
+    robots_trees, L, m = assignment.schedule()
     routes = {}
     for r, trees in robots_trees.items():
-        sched = SingleRobotSchedule(trees, L, k)
+        sched = SingleRobotSchedule(trees, L, k, m)
         sched.compute_schedule()
         routes[r] = sched.get_routes()
+    # print_all_routes(routes)
     return routes, L, robots_trees
+
+def print_all_routes(routes):
+    for robot_id, segments in routes.items():
+        flat_path = []
+        for seg in segments:
+            if isinstance(seg, (list, tuple)):
+                flat_path.extend(seg)
+            else:
+                flat_path.append(seg)
+
+        # Remove consecutive duplicates
+        cleaned_path = []
+        for node in flat_path:
+            if not cleaned_path or cleaned_path[-1] != node:
+                cleaned_path.append(node)
+
+        print(f"\nRobot {robot_id} full route: {cleaned_path}")
 
 def visualize_routes(graph: nx.Graph, routes: dict, robots_trees: dict, L, k, coords=None):
     """
@@ -682,41 +735,6 @@ def visualize_routes(graph: nx.Graph, routes: dict, robots_trees: dict, L, k, co
         pos = coords
 
     colors = ['red', 'blue', 'green', 'purple', 'orange', 'brown']
-
-    '''
-    for r, trees in robots_trees.items():
-        print(f"\nRobot {r} clusters and paths:")
-
-        # Create SingleRobotSchedule to get paths per tree
-        sched = SingleRobotSchedule(trees, L, k)
-        sched.compute_schedule()
-
-        for idx, T in enumerate(trees):
-            print(f"  Cluster {idx} (nodes: {list(T.nodes)}):")
-            if T.number_of_nodes() <= 1:
-                # print("    Single node or empty cluster, no paths.")
-                continue
-
-            paths = sched.paths_per_tree[idx]
-            if not paths:
-                # print("    No paths in this cluster.")
-                continue
-
-            tour_nodes = list(nx.approximation.traveling_salesman_problem(T, weight='weight'))
-            cycle_length = 0
-            for i in range(len(tour_nodes)-1):
-                u = tour_nodes[i]
-                v = tour_nodes[(i + 1) % len(tour_nodes)]
-                cycle_length += T[u][v]['weight']
-
-            cluster_weight = sum(T.nodes[n].get('weight', 1) for n in T.nodes)
-            cluster_latency = cluster_weight * cycle_length
-            print(f"    Cluster latency: {cluster_latency:.3f}")
-            print(f"    Paths in cluster:")
-
-            for pidx, path in enumerate(paths):
-                print(f"      Path {pidx}: {path}")
-    '''
     plt.figure(figsize=(10, 10))
 
     # Draw base graph with nodes and edges
@@ -753,6 +771,7 @@ def visualize_routes(graph: nx.Graph, routes: dict, robots_trees: dict, L, k, co
             if not cleaned_path or cleaned_path[-1] != node:
                 cleaned_path.append(node)
 
+        print("hi")
         # Identify if path is a single node loop
         if len(cleaned_path) == 1:
             node = cleaned_path[0]
@@ -810,30 +829,29 @@ def visualize_routes(graph: nx.Graph, routes: dict, robots_trees: dict, L, k, co
 
 def compute_max_latency_weighted(routes, graph, node_weight_attr='weight', edge_weight_attr='weight'):
     """
-    Compute max latency and print the node causing max latency, the cycle path it belongs to, and cycle length.
+    Compute max weighted latency:
+      For each node, find its max time between visits in the route.
+      Multiply by node weight.
+      Return the maximum across all nodes.
 
     Args:
-        routes: dict {robot_id: list of segments (list of nodes or ints)}
-        graph: nx.Graph with node weights and edge weights
-        node_weight_attr: node attribute name for node weights
-        edge_weight_attr: edge attribute name for edge weights
-
+        routes: {robot_id: [segments]}
+        graph: nx.Graph
     Returns:
-        max_latency: float, maximum latency across all nodes
-        node_latency: dict {node: latency}
-        max_latency_node: node with max latency
-        max_latency_cycle: list of nodes forming the cycle for max latency node
-        max_cycle_length: float, cycle length for that cycle
+        max_latency: float
+        node_latency: {node: weighted latency}
+        max_latency_node: node with max
+        max_latency_cycle: cycle where max occurs
+        max_cycle_length: cycle length where max occurs
     """
     max_latency = 0
     node_latency = {}
-
     max_latency_node = None
     max_latency_cycle = None
     max_cycle_length = 0
 
     for r, segments in routes.items():
-        # Flatten route segments to one continuous cycle path
+        # Flatten segments
         flat_path = []
         for seg in segments:
             if isinstance(seg, int):
@@ -841,41 +859,72 @@ def compute_max_latency_weighted(routes, graph, node_weight_attr='weight', edge_
             else:
                 flat_path.extend(seg)
 
-        # Remove consecutive duplicates between segments
+        if len(flat_path) < 2:
+            continue
+
+        # Remove consecutive duplicates AND handle cycle wrap-around
         cleaned_path = []
         for n in flat_path:
             if not cleaned_path or cleaned_path[-1] != n:
                 cleaned_path.append(n)
+        # Also check head/tail
+        if len(cleaned_path) > 1 and cleaned_path[0] == cleaned_path[-1]:
+            cleaned_path.pop()
+
+        # print(cleaned_path)
+        # If only one unique vertex, latency is 0
+        if len(set(cleaned_path)) == 1:
+            return 0, {}, None, None, 0
 
         if len(cleaned_path) < 2:
-            continue  # no meaningful cycle
+            continue
 
-        # Compute cycle length (sum of edge weights in cycle)
-        cycle_length = 0
-        for i in range(len(cleaned_path)-1):
+        # Compute edge lengths
+        edge_lengths = []
+        for i in range(len(cleaned_path)):
             u = cleaned_path[i]
-            v = cleaned_path[(i + 1) % len(cleaned_path)]  # wrap around for cycle
+            v = cleaned_path[(i + 1) % len(cleaned_path)]
             w = graph[u][v].get(edge_weight_attr, 1)
-            cycle_length += w
+            edge_lengths.append(w)
 
-        visited_nodes = set(cleaned_path)
-        for node in visited_nodes:
+        total_cycle_length = sum(edge_lengths)
+
+        print("hiii")
+        # For each node, compute max gap between visits
+        node_positions = {}
+        for idx, node in enumerate(cleaned_path):
+            node_positions.setdefault(node, []).append(idx)
+
+        for node, positions in node_positions.items():
+            gaps = []
+            for i in range(len(positions)):
+                a = positions[i]
+                b = positions[(i + 1) % len(positions)]
+                if b > a:
+                    gap_edges = edge_lengths[a:b]
+                else:
+                    gap_edges = edge_lengths[a:] + edge_lengths[:b]
+                gap_length = sum(gap_edges)
+                gaps.append(gap_length)
+
+            max_gap = max(gaps)
             w_node = graph.nodes[node].get(node_weight_attr, 1)
-            latency = w_node * cycle_length
+            latency = w_node * max_gap
+
             node_latency[node] = max(node_latency.get(node, 0), latency)
 
             if latency > max_latency:
                 max_latency = latency
                 max_latency_node = node
                 max_latency_cycle = cleaned_path
-                max_cycle_length = cycle_length
+                max_cycle_length = total_cycle_length
 
     return max_latency, node_latency, max_latency_node, max_latency_cycle, max_cycle_length
 
 # === Testing Ground ===
 
 # Example 1: General Graph with uniform random placement in square [-1,1]^2
-G = nx.complete_graph(10)
+G = nx.complete_graph(30)
 coords = {i: (random.uniform(-1, 1), random.uniform(-1, 1)) for i in G.nodes()}
 for u, v in G.edges():
     G[u][v]['weight'] = math.dist(coords[u], coords[v])
@@ -889,12 +938,11 @@ end_time = time.time()
 print(f"Algorithm took {end_time - start_time:.6f} seconds for Graph 1.")
 
 visualize_routes(G, routes, trees, L, k, coords)
-compute_max_latency_weighted(routes, G)
 
 # Example 2: Clustered graph with clusters randomly placed in separated squares on x-axis
 G2 = nx.Graph()
-num_clusters = 4
-cluster_size = 3
+num_clusters = 5
+cluster_size = 6
 
 coords2 = {}
 square_size = 2
@@ -929,4 +977,45 @@ end_time = time.time()
 print(f"Algorithm took {end_time - start_time:.6f} seconds for Graph 2.")
 
 visualize_routes(G2, routes2, trees2, L2, k, coords2)
-compute_max_latency_weighted(routes2, G2)
+
+# === Example 3: Forced multi-robot test ===
+
+G3 = nx.Graph()
+num_clusters = 4      
+cluster_size = 2
+
+coords3 = {}
+square_size = 1
+gap = 1000  # VERY large gap to ensure separation forces multiple robots
+
+# Place 4 clusters far apart
+for c in range(num_clusters):
+    base_x = c * (square_size + gap)
+    base_y = 0
+    nodes = [c * cluster_size + i for i in range(cluster_size)]
+    for node in nodes:
+        G3.add_node(node, weight=random.uniform(0.5, 1.0))  # non-trivial weight
+        x = random.uniform(base_x, base_x + square_size)
+        y = random.uniform(base_y, base_y + square_size)
+        coords3[node] = (x, y)
+
+    # Fully connect inside each cluster
+    for i in nodes:
+        for j in nodes:
+            if i < j:
+                G3.add_edge(i, j, weight=math.dist(coords3[i], coords3[j]))
+
+# Add sparse cross-cluster edges with very high cost to ensure separation
+for i in range(num_clusters * cluster_size):
+    for j in range(num_clusters * cluster_size):
+        if (i // cluster_size) != (j // cluster_size) and i < j:
+            G3.add_edge(i, j, weight=10000)
+
+k = 4
+
+start_time = time.time()
+routes3, L3, trees3 = schedule_all_routes(G3, k)
+end_time = time.time()
+print(f"Algorithm took {end_time - start_time:.6f} seconds for Graph 3.")
+
+visualize_routes(G3, routes3, trees3, L3, k, coords3)
